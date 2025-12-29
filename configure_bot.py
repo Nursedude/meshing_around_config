@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Interactive Configuration Tool for Meshing-Around Bot
-Helps configure alert settings and other bot parameters
+Meshing-Around Enhanced Configuration Tool
+Interactive setup for the meshing-around Meshtastic bot
+
+Supports:
+- Raspberry Pi OS Bookworm (Debian 12)
+- Raspberry Pi OS Trixie (Debian 13)
+- Standard Debian/Ubuntu systems
+
+Features:
+- Automatic system updates at startup
+- Virtual environment setup for PEP 668 compliance
+- Serial port detection and configuration
+- raspi-config integration for Raspberry Pi
 """
 
 import os
@@ -14,6 +25,10 @@ import configparser
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
 from getpass import getpass
+
+# Version info
+VERSION = "2.0.0"
+SUPPORTED_OS = ["bookworm", "trixie", "forky", "sid", "noble", "jammy"]
 
 class Colors:
     """ANSI color codes for terminal output"""
@@ -396,6 +411,251 @@ def raspberry_pi_setup() -> Tuple[bool, Optional[Path]]:
         print_info(f"Activate before running bot: source {venv_path}/bin/activate")
 
     return len(errors) == 0, venv_path
+
+
+def get_pi_config_path() -> Path:
+    """Get the correct config.txt path for Bookworm/Trixie"""
+    # Bookworm and newer use /boot/firmware/config.txt
+    bookworm_path = Path("/boot/firmware/config.txt")
+    legacy_path = Path("/boot/config.txt")
+
+    if bookworm_path.exists():
+        return bookworm_path
+    elif legacy_path.exists():
+        return legacy_path
+    else:
+        # Default to Bookworm path for new installations
+        return bookworm_path
+
+
+def check_serial_enabled() -> Tuple[bool, bool]:
+    """Check if serial port is enabled in config.txt
+    Returns: (uart_enabled, console_enabled)
+    """
+    config_path = get_pi_config_path()
+
+    if not config_path.exists():
+        return False, False
+
+    try:
+        with open(config_path, 'r') as f:
+            content = f.read()
+
+        uart_enabled = 'enable_uart=1' in content
+        # Check if console is on serial (in cmdline.txt)
+        cmdline_path = config_path.parent / "cmdline.txt"
+        console_enabled = False
+        if cmdline_path.exists():
+            with open(cmdline_path, 'r') as f:
+                cmdline = f.read()
+                console_enabled = 'console=serial' in cmdline or 'console=ttyAMA' in cmdline
+
+        return uart_enabled, console_enabled
+    except:
+        return False, False
+
+
+def configure_serial_raspi_config() -> bool:
+    """Configure serial port using raspi-config (non-interactive)"""
+    print_section("Serial Port Configuration")
+
+    if not is_raspberry_pi():
+        print_info("Not a Raspberry Pi - skipping raspi-config")
+        return True
+
+    # Check if raspi-config exists
+    ret, _, _ = run_command(['which', 'raspi-config'], capture=True)
+    if ret != 0:
+        print_warning("raspi-config not found - manual configuration may be needed")
+        return False
+
+    uart_enabled, console_enabled = check_serial_enabled()
+
+    if uart_enabled:
+        print_success("UART is already enabled")
+        if console_enabled:
+            print_warning("Serial console is enabled - this may interfere with Meshtastic")
+            if get_yes_no("Disable serial console (recommended for Meshtastic)?", True):
+                # Disable console but keep hardware serial
+                ret, _, stderr = run_command(
+                    ['raspi-config', 'nonint', 'do_serial_cons', '1'],
+                    sudo=True
+                )
+                if ret == 0:
+                    print_success("Serial console disabled")
+                else:
+                    print_error(f"Failed to disable console: {stderr}")
+        return True
+
+    print_warning("UART is not enabled")
+    if not get_yes_no("Enable UART for Meshtastic serial connection?", True):
+        return False
+
+    # Enable serial hardware, disable console
+    print_info("Enabling serial port via raspi-config...")
+
+    # do_serial_hw 0 = enable, 1 = disable (yes, it's backwards)
+    ret, _, stderr = run_command(
+        ['raspi-config', 'nonint', 'do_serial_hw', '0'],
+        sudo=True
+    )
+    if ret != 0:
+        print_error(f"Failed to enable serial hardware: {stderr}")
+        return False
+
+    # Disable console on serial
+    ret, _, stderr = run_command(
+        ['raspi-config', 'nonint', 'do_serial_cons', '1'],
+        sudo=True
+    )
+    if ret == 0:
+        print_success("Serial port enabled, console disabled")
+        print_warning("A reboot is required for changes to take effect!")
+        return True
+    else:
+        print_error(f"Failed to configure serial console: {stderr}")
+        return False
+
+
+def enable_i2c_spi() -> bool:
+    """Enable I2C and SPI interfaces if needed"""
+    if not is_raspberry_pi():
+        return True
+
+    print_section("I2C/SPI Configuration")
+
+    # Check if raspi-config exists
+    ret, _, _ = run_command(['which', 'raspi-config'], capture=True)
+    if ret != 0:
+        print_warning("raspi-config not found")
+        return False
+
+    # Check current I2C status
+    ret, stdout, _ = run_command(['raspi-config', 'nonint', 'get_i2c'], capture=True)
+    i2c_enabled = ret == 0 and stdout.strip() == '0'
+
+    if i2c_enabled:
+        print_success("I2C is already enabled")
+    else:
+        if get_yes_no("Enable I2C interface?", False):
+            ret, _, _ = run_command(['raspi-config', 'nonint', 'do_i2c', '0'], sudo=True)
+            if ret == 0:
+                print_success("I2C enabled")
+            else:
+                print_warning("Failed to enable I2C")
+
+    # Check SPI status
+    ret, stdout, _ = run_command(['raspi-config', 'nonint', 'get_spi'], capture=True)
+    spi_enabled = ret == 0 and stdout.strip() == '0'
+
+    if spi_enabled:
+        print_success("SPI is already enabled")
+    else:
+        if get_yes_no("Enable SPI interface?", False):
+            ret, _, _ = run_command(['raspi-config', 'nonint', 'do_spi', '0'], sudo=True)
+            if ret == 0:
+                print_success("SPI enabled")
+            else:
+                print_warning("Failed to enable SPI")
+
+    return True
+
+
+def startup_system_check() -> bool:
+    """Run system checks and updates at startup"""
+    print_header("Meshing-Around Enhanced Configuration Tool")
+    print(f"Version {VERSION}\n")
+
+    # Detect platform
+    os_name, os_codename = get_os_info()
+
+    if is_raspberry_pi():
+        pi_model = get_pi_model()
+        print_success(f"Platform: {pi_model}")
+    else:
+        print_info("Platform: Standard Linux system")
+
+    print(f"OS: {os_name} ({os_codename})")
+
+    # Check if this is a supported OS
+    if os_codename.lower() in SUPPORTED_OS:
+        print_success(f"OS version supported")
+    else:
+        print_warning(f"OS version '{os_codename}' may not be fully tested")
+
+    # Check Python version
+    py_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    if sys.version_info >= (3, 9):
+        print_success(f"Python {py_version}")
+    else:
+        print_warning(f"Python {py_version} - version 3.9+ recommended")
+
+    # Offer to run system update
+    print_section("System Update")
+    print_info("It's recommended to update your system before proceeding")
+
+    if get_yes_no("Run system update now (apt update && apt upgrade)?", True):
+        errors = []
+
+        # apt update
+        print_step(1, 3, "Updating package lists...")
+        ret, _, stderr = run_command(['apt', 'update'], sudo=True)
+        if ret != 0:
+            errors.append(f"apt update: {stderr}")
+            print_warning("Failed to update package lists")
+        else:
+            print_success("Package lists updated")
+
+        # apt upgrade
+        print_step(2, 3, "Upgrading packages...")
+        ret, _, stderr = run_command(['apt', 'upgrade', '-y'], sudo=True)
+        if ret != 0:
+            errors.append(f"apt upgrade: {stderr}")
+            print_warning("Failed to upgrade packages")
+        else:
+            print_success("Packages upgraded")
+
+        # Cleanup
+        print_step(3, 3, "Cleaning up...")
+        run_command(['apt', 'autoremove', '-y'], sudo=True)
+        print_success("Cleanup complete")
+
+        if errors:
+            print_warning("Some updates failed (may be normal without network):")
+            for err in errors:
+                print_info(f"  {err[:60]}...")
+    else:
+        print_info("Skipping system update")
+
+    # Pi-specific checks
+    if is_raspberry_pi():
+        # Check for required packages on Pi
+        print_section("Raspberry Pi Prerequisites")
+
+        required_pkgs = ['python3-pip', 'python3-venv', 'git', 'i2c-tools']
+        missing = []
+
+        for pkg in required_pkgs:
+            ret, _, _ = run_command(['dpkg', '-s', pkg], capture=True)
+            if ret != 0:
+                missing.append(pkg)
+
+        if missing:
+            print_warning(f"Missing packages: {', '.join(missing)}")
+            if get_yes_no("Install missing packages?", True):
+                ret, _, _ = run_command(['apt', 'install', '-y'] + missing, sudo=True)
+                if ret == 0:
+                    print_success("Packages installed")
+                else:
+                    print_warning("Some packages failed to install")
+        else:
+            print_success("All required packages installed")
+
+        # Configure serial if needed
+        configure_serial_raspi_config()
+
+    return True
+
 
 def get_input(prompt: str, default: str = "", input_type: type = str, password: bool = False) -> Any:
     """Get user input with optional default value and password masking"""
@@ -1277,17 +1537,11 @@ def save_config(config: configparser.ConfigParser, config_file: str):
 
 def main_menu():
     """Display main menu and handle user selection"""
-    print_header("Meshing-Around Interactive Configuration Tool")
+    # Run startup checks (includes system update)
+    startup_system_check()
 
     print("\nThis tool will help you configure your Meshtastic bot")
     print("You can configure alert settings, connection parameters, and more\n")
-
-    # Detect Raspberry Pi
-    if is_raspberry_pi():
-        pi_model = get_pi_model()
-        print_success(f"Raspberry Pi detected: {pi_model}")
-        if is_bookworm_or_newer():
-            print_info("OS: Bookworm or newer (PEP 668 support enabled)")
 
     # Show startup menu
     print_section("Start Menu")

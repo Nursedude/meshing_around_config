@@ -1,6 +1,13 @@
-# Meshing-Around Enhanced Alert Configuration
+# Meshing-Around Enhanced Configuration Tool
 
 Enhanced configuration system and interactive setup tool for the [meshing-around](https://github.com/SpudGunMan/meshing-around) Meshtastic bot project.
+
+## Supported Platforms
+
+- **Raspberry Pi OS Bookworm** (Debian 12)
+- **Raspberry Pi OS Trixie** (Debian 13)
+- **Ubuntu 22.04/24.04** (Jammy/Noble)
+- **Standard Debian systems**
 
 ## 🚀 Quick Start
 
